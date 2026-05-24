@@ -9,210 +9,278 @@ from pyspark.sql.types import *
 # 0. 初始化 Spark Session
 # ==========================================
 spark = SparkSession.builder \
-    .appName("V2X_Trip_CoreLogic_Test") \
+    .appName("Signal_Engine_Trip_Logic_Full_Test") \
     .master("local[*]") \
     .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
     .getOrCreate()
 
 spark.sparkContext.setLogLevel("ERROR")
 
+# 定义 UDF 输出 Schema
 result_schema = StructType([
     StructField("vin", StringType()),
     StructField("row_type", StringType()),      
     StructField("trip_type", StringType()),     
+    StructField("phase", StringType()),         
     StructField("start_time", TimestampType()), 
     StructField("end_time", TimestampType()),   
     StructField("max_speed", DoubleType()),     
     StructField("avg_speed", DoubleType()),     
     StructField("last_ts", TimestampType()),    
+    StructField("last_speed_ts", TimestampType()), 
     StructField("state_speeds", StringType())   
 ])
 
 # ==========================================
-# 1. 核心 UDF 逻辑 (无需修改)
+# 1. 核心状态机 UDF (完全保持不变)
 # ==========================================
-def process_t_plus_1_with_metrics(key: tuple, pdf: pd.DataFrame) -> pd.DataFrame:
+def process_trip_state_machine(key: tuple, pdf: pd.DataFrame) -> pd.DataFrame:
     vin = key[0]
     output_rows = []
     
+    # 时序排序
     pdf = pdf.sort_values(by=['timestamp', 'is_state'], ascending=[True, False])
     
-    phase, trip_start, stop_start = 'OFF', None, None
+    # 状态机初始化
+    phase = 'OFF'
+    trip_type_so_far = 'PARKING'
+    trip_start = None
+    hang_start = None
     last_ts = None
+    last_speed_ts = None
     trip_speeds = [] 
     
-    SPEED_THRESHOLD = 3.0
-    MAX_GAP_SECONDS = 12 * 3600 
-    
-    def emit_trip(trip_t, t_start, t_end, speeds):
-        if not speeds:
-            return (vin, 'TRIP', trip_t, t_start, t_end, 0.0, 0.0, t_end, None)
-        return (vin, 'TRIP', trip_t, t_start, t_end, float(np.max(speeds)), float(np.mean(speeds)), t_end, None)
+    def emit_trip(t_type, t_start, t_end, speeds):
+        if pd.isna(t_start) or pd.isna(t_end) or t_start >= t_end:
+            return None
+        max_s = float(np.max(speeds)) if speeds else 0.0
+        avg_s = float(np.mean(speeds)) if speeds else 0.0
+        return (vin, 'TRIP', t_type, None, t_start, t_end, max_s, avg_s, t_end, None, None)
 
     for _, row in pdf.iterrows():
-        if row['is_state'] == 1:
-            phase = row['state_phase']
-            trip_start = row['state_trip_start']
-            stop_start = row['state_stop_start']
-            last_ts = row['timestamp']
-            state_speeds_str = row.get('state_speeds', '')
-            trip_speeds = [float(x) for x in state_speeds_str.split(',')] if pd.notna(state_speeds_str) and state_speeds_str else []
-            continue
-            
+        # 简化版：仅处理当日日志
         ts = row['timestamp']
         power = row['syspowermod_2012001']
-        speed = row['vehspd_2011002']
+        speed = float(row['vehspd_2011002']) if pd.notna(row['vehspd_2011002']) else 0.0
         
-        if last_ts and (ts - last_ts).total_seconds() > MAX_GAP_SECONDS:
-            if phase != 'OFF':
-                if phase == 'DRIVE' or phase == 'STOP_WAIT':
-                    output_rows.append(emit_trip('DRIVING', trip_start, last_ts, trip_speeds))
-                phase, trip_start, stop_start, trip_speeds = 'OFF', None, None, []
-                
-        last_ts = ts 
-        
+        # [规则 4] 异常兜底 (防死锁)：检测数据断层超 15 分钟
+        if phase != 'OFF' and last_ts is not None:
+            if (ts - last_ts).total_seconds() > 900:
+                end_time_fallback = hang_start if phase == 'HANG_OFF' else last_ts
+                trip_record = emit_trip(trip_type_so_far, trip_start, end_time_fallback, trip_speeds)
+                if trip_record: output_rows.append(trip_record)
+                phase, trip_speeds = 'OFF', []
+                trip_type_so_far, last_speed_ts = 'PARKING', None
+
+        # 状态跃迁逻辑
         if phase == 'OFF':
-            if power == 2 and speed <= SPEED_THRESHOLD:
-                phase, trip_start, trip_speeds = 'PRE_PARK', ts, []
-            elif power == 2 and speed > SPEED_THRESHOLD:
-                phase, trip_start, trip_speeds = 'DRIVE', ts, [speed]
+            if power == 2 or speed > 0:
+                phase = 'ACTIVE'
+                trip_start = ts
+                trip_type_so_far = 'DRIVING' if speed > 0 else 'PARKING'
+                last_speed_ts = ts if speed > 0 else None
+                trip_speeds = [speed]
 
-        elif phase == 'PRE_PARK':
-            if speed > SPEED_THRESHOLD:
-                duration_mins = (ts - trip_start).total_seconds() / 60.0
-                if duration_mins > 15:
-                    output_rows.append(emit_trip('PRE_PARKING', trip_start, ts, []))
-                    trip_start, trip_speeds = ts, [speed]
-                else:
+        elif phase == 'HANG_OFF':
+            if (ts - hang_start).total_seconds() > 300:
+                trip_record = emit_trip(trip_type_so_far, trip_start, hang_start, trip_speeds)
+                if trip_record: output_rows.append(trip_record)
+                phase, trip_speeds = 'OFF', []
+                trip_type_so_far, last_speed_ts = 'PARKING', None
+                
+                if power == 2 or speed > 0:
+                    phase = 'ACTIVE'
+                    trip_start = ts
+                    trip_type_so_far = 'DRIVING' if speed > 0 else 'PARKING'
+                    last_speed_ts = ts if speed > 0 else None
+                    trip_speeds = [speed]
+            else:
+                if power == 2 or speed > 0:
+                    phase = 'ACTIVE'
                     trip_speeds.append(speed)
-                phase = 'DRIVE'
-            elif power == 0:
-                phase = 'OFF'
+                    if speed > 0:
+                        trip_type_so_far = 'DRIVING'
+                        last_speed_ts = ts
 
-        elif phase == 'DRIVE':
-            if speed > SPEED_THRESHOLD:
-                trip_speeds.append(speed)
-            if speed <= SPEED_THRESHOLD or power == 0:
-                phase, stop_start = 'STOP_WAIT', ts
-
-        elif phase == 'STOP_WAIT':
-            if speed > SPEED_THRESHOLD:
-                trip_speeds.append(speed)
-            duration_mins = (ts - stop_start).total_seconds() / 60.0
+        if phase == 'ACTIVE':
+            split_happened = False
             
-            if speed > SPEED_THRESHOLD and power == 2:
-                if duration_mins <= 15:
-                    phase = 'DRIVE'
-                else:
-                    drive_speeds = trip_speeds[:-1] 
-                    output_rows.append(emit_trip('DRIVING', trip_start, stop_start, drive_speeds))
-                    output_rows.append(emit_trip('POST_PARKING', stop_start, ts, [0.0]))
-                    phase, trip_start, trip_speeds = 'DRIVE', ts, [speed]
-            elif power == 0:
-                if duration_mins <= 15:
-                    output_rows.append(emit_trip('DRIVING', trip_start, ts, trip_speeds))
-                    phase = 'OFF'
-                else:
-                    drive_speeds = trip_speeds[:-1]
-                    output_rows.append(emit_trip('DRIVING', trip_start, stop_start, drive_speeds))
-                    output_rows.append(emit_trip('POST_PARKING', stop_start, ts, [0.0]))
-                    phase = 'OFF'
+            if trip_type_so_far == 'DRIVING' and speed == 0 and last_speed_ts is not None:
+                if (ts - last_speed_ts).total_seconds() > 900:
+                    trip_record = emit_trip('DRIVING', trip_start, last_speed_ts, trip_speeds)
+                    if trip_record: output_rows.append(trip_record)
                     
-    state_speeds_str = ','.join(map(str, trip_speeds)) if phase != 'OFF' and trip_speeds else None
-    output_rows.append((vin, 'STATE', phase, trip_start, stop_start, None, None, last_ts, state_speeds_str))
+                    trip_start = last_speed_ts
+                    trip_type_so_far = 'PARKING'
+                    last_speed_ts = None
+                    trip_speeds = [0.0]
+                    split_happened = True
+                    
+            elif trip_type_so_far == 'PARKING' and speed > 0:
+                if (ts - trip_start).total_seconds() > 900:
+                    trip_record = emit_trip('PARKING', trip_start, last_ts, trip_speeds)
+                    if trip_record: output_rows.append(trip_record)
+                    
+                    trip_start = last_ts
+                    trip_type_so_far = 'DRIVING'
+                    last_speed_ts = ts
+                    trip_speeds = [speed]
+                    split_happened = True
+                else:
+                    trip_type_so_far = 'DRIVING'
+                    last_speed_ts = ts
+
+            if not split_happened:
+                trip_speeds.append(speed)
+                if speed > 0:
+                    last_speed_ts = ts
+
+            if power == 0:
+                phase = 'HANG_OFF'
+                hang_start = ts
+
+        last_ts = ts
+                    
+    # 批次结束清理残存状态 (用于单独跑批验证)
+    if phase != 'OFF':
+        end_time_fallback = hang_start if phase == 'HANG_OFF' else last_ts
+        trip_record = emit_trip(trip_type_so_far, trip_start, end_time_fallback, trip_speeds)
+        if trip_record: output_rows.append(trip_record)
 
     return pd.DataFrame(output_rows, columns=result_schema.names)
 
 # ==========================================
-# 2. 构造 1秒/条 密度的动作模拟数据
+# 2. 真实车辆行为数据生成器 (增加跨天场景)
 # ==========================================
+print("\n" + "🚀"*3 + " 开始生成全场景路测数据 (包含跨天借时数据) " + "🚀"*3)
+
 def append_action(data_list, vin, start_time, duration_minutes, power, speed, label=""):
-    """辅助函数：模拟 1秒1条 的连续数据，方便计算 avg_speed"""
     current_time = start_time
-    for _ in range(int(duration_minutes * 60)):
-        # 加上一点随机抖动让速度更真实
-        actual_speed = speed + np.random.uniform(-2, 2) if speed > 0 else 0.0
+    for _ in range(int(duration_minutes)):
+        actual_speed = round(speed + np.random.uniform(-2, 2), 2) if speed > 0 else 0.0
         data_list.append((vin, current_time, power, actual_speed, label))
-        current_time += datetime.timedelta(seconds=1)
+        current_time += datetime.timedelta(minutes=1)
     return current_time
 
-def generate_core_logic_data():
-    data = []
-    
-    # 🚗 [测试 1] 行驶合并测试 (红绿灯 <= 15分)
-    t = datetime.datetime(2023, 10, 2, 8, 0, 0)
-    t = append_action(data, "VIN_1_DRIVE", t, duration_minutes=10, power=2, speed=40.0, label="起步行驶")
-    t = append_action(data, "VIN_1_DRIVE", t, duration_minutes=5, power=2, speed=0.0, label="等红绿灯(5分)")
-    t = append_action(data, "VIN_1_DRIVE", t, duration_minutes=10, power=2, speed=60.0, label="继续行驶")
-    data.append(("VIN_1_DRIVE", t, 0, 0.0, "下电熄火"))
+raw_data = []
+base_time = datetime.datetime(2026, 5, 20, 8, 0, 0)
 
-    # 🚗 [测试 2] 前驻车切分测试 (原地热车 > 15分)
-    t = datetime.datetime(2023, 10, 2, 9, 0, 0)
-    t = append_action(data, "VIN_2_PRE_SPLIT", t, duration_minutes=20, power=2, speed=0.0, label="上电静止(20分)")
-    t = append_action(data, "VIN_2_PRE_SPLIT", t, duration_minutes=5, power=2, speed=30.0, label="起步")
-    data.append(("VIN_2_PRE_SPLIT", t, 0, 0.0, "下电熄火"))
+# 分配车辆到 7 大场景 (新增 G 场景模拟跨天)
+scenario_distribution = {
+    'A': 20, # 场景A: 正常通勤 (20辆)
+    'B': 10, # 场景B: 短暂抽烟纯驻车 (10辆)
+    'C': 20, # 场景C: 中途长时等待 (20辆)
+    'D': 20, # 场景D: 加油站短时下电合并 (20辆)
+    'E': 10, # 场景E: 进地库断网 (10辆)
+    'F': 20, # 场景F: 自动启停/极端短下电 (20辆)
+    'G': 5   # [新增] 场景G: 跨天硬切验证 (5辆)
+}
 
-    # 🚗 [测试 3] 后驻车切分测试 (停车不熄火 > 15分)
-    t = datetime.datetime(2023, 10, 2, 11, 0, 0)
-    t = append_action(data, "VIN_3_POST_SPLIT", t, duration_minutes=10, power=2, speed=40.0, label="行驶")
-    t = append_action(data, "VIN_3_POST_SPLIT", t, duration_minutes=20, power=2, speed=0.0, label="停车不熄火(20分)")
-    data.append(("VIN_3_POST_SPLIT", t, 0, 0.0, "终于下电"))
+vin_counter = 1
+for scenario, count in scenario_distribution.items():
+    for _ in range(count):
+        vin = f"LSV_SCENARIO_{scenario}_{vin_counter:03d}"
+        t = base_time
+        
+        if scenario == 'A':
+            t = append_action(raw_data, vin, t, 10, 2, 45.0, "行驶")
+            t = append_action(raw_data, vin, t, 3, 2, 0.0, "等红绿灯")
+            t = append_action(raw_data, vin, t, 10, 2, 40.0, "行驶")
+            raw_data.append((vin, t, 0, 0.0, "熄火下电"))
+            
+        elif scenario == 'B':
+            t = append_action(raw_data, vin, t, 5, 2, 0.0, "车内休息")
+            raw_data.append((vin, t, 0, 0.0, "熄火下电"))
+            
+        elif scenario == 'C':
+            t = append_action(raw_data, vin, t, 10, 2, 35.0, "行驶")
+            t = append_action(raw_data, vin, t, 20, 2, 0.0, "长时间等人(触发15分切分)")
+            t = append_action(raw_data, vin, t, 10, 2, 50.0, "行驶")
+            raw_data.append((vin, t, 0, 0.0, "熄火下电"))
+            
+        elif scenario == 'D':
+            t = append_action(raw_data, vin, t, 20, 2, 60.0, "行驶")
+            raw_data.append((vin, t, 0, 0.0, "进站熄火"))
+            t += datetime.timedelta(minutes=3)
+            t = append_action(raw_data, vin, t, 10, 2, 55.0, "继续行驶")
+            raw_data.append((vin, t, 0, 0.0, "最终熄火"))
+            
+        elif scenario == 'E':
+            t = append_action(raw_data, vin, t, 15, 2, 30.0, "行驶")
+            t = append_action(raw_data, vin, t, 1, 2, 0.0, "进地库找车位")
+            t += datetime.timedelta(hours=2)
+            raw_data.append((vin, t, 2, 0.0, "次日重新上电(触发昨日兜底结算)"))
 
-    return data
+        elif scenario == 'F':
+            t = append_action(raw_data, vin, t, 10, 2, 35.0, "行驶")
+            raw_data.append((vin, t, 0, 0.0, "启停下电"))
+            t += datetime.timedelta(minutes=1)
+            t = append_action(raw_data, vin, t, 10, 2, 40.0, "继续行驶")
+            raw_data.append((vin, t, 0, 0.0, "最终熄火"))
 
-# ==========================================
-# 3. 执行计算与对比展示
-# ==========================================
-raw_records = generate_core_logic_data()
-raw_df = spark.createDataFrame(
-    raw_records, 
-    schema=["vin", "timestamp", "syspowermod_2012001", "vehspd_2011002", "action_label"]
-)
+        elif scenario == 'G':
+            # [新增] 模拟 T-1 借时数据: 昨天(19号) 23:45 出发，今天(20号) 00:15 熄火
+            t = datetime.datetime(2026, 5, 19, 23, 45, 0)
+            t = append_action(raw_data, vin, t, 30, 2, 45.0, "跨天连夜行驶")
+            raw_data.append((vin, t, 0, 0.0, "次日凌晨熄火"))
 
-# 剥离 action_label 投入 UDF (UDF不需要这个字段，这只是为了打印好看)
+        vin_counter += 1
+
+# 转换为 DataFrame (此时 input_df 里已经自然包含了 19 号晚间和 20 号全天的数据)
+raw_df = spark.createDataFrame(raw_data, schema=["vin", "timestamp", "syspowermod_2012001", "vehspd_2011002", "action_label"])
+
 input_df = raw_df.select(
     F.col("vin"), F.col("timestamp"), F.col("syspowermod_2012001"), F.col("vehspd_2011002"),
-    F.lit(0).cast(IntegerType()).alias("is_state"), F.lit(None).cast(StringType()).alias("state_phase"),
-    F.lit(None).cast(TimestampType()).alias("state_trip_start"), F.lit(None).cast(TimestampType()).alias("state_stop_start"), F.lit(None).cast(StringType()).alias("state_speeds")
+    F.lit(0).cast(IntegerType()).alias("is_state")
 )
 
-processed_df = input_df.groupBy("vin").applyInPandas(process_t_plus_1_with_metrics, schema=result_schema).cache()
-trips_df = processed_df.filter(F.col("row_type") == 'TRIP')
+# ==========================================
+# 3. 执行状态机切分并输出核心指标
+# ==========================================
+print("\n" + "🔥"*3 + " 开始执行引擎跑批 (分布式 Pandas UDF) " + "🔥"*3)
 
-# 为了不被 1秒1条 的数据刷屏，我们用 groupBy 浓缩打印原始输入：
-raw_summary_df = raw_df.groupBy("vin", "action_label").agg(
-    F.min("timestamp").alias("动作开始时间"),
-    F.max("timestamp").alias("动作结束时间"),
-    F.round(F.avg("vehspd_2011002"), 1).alias("大概车速")
-).orderBy("vin", "动作开始时间")
+# 1. 正常过一遍 UDF (UDF 遇到缝隙小于15分钟的跨天数据，会自动连起来)
+processed_df = input_df.groupBy("vin").applyInPandas(process_trip_state_machine, schema=result_schema).cache()
 
-# ----------------- 打印区域 -----------------
-vins = ["VIN_1_DRIVE", "VIN_2_PRE_SPLIT", "VIN_3_POST_SPLIT"]
+# 2. 模拟生产跑批日期: 假设今天是 2026-05-20，我们只保留结束时间在 20 号的行程
+target_date = "2026-05-20"
 
-print("\n" + "★"*80)
-print(" 🚀 V2X 行程切分逻辑：输入与输出对比验证")
-print("★"*80)
+output_df = processed_df.filter(F.col("row_type") == 'TRIP') \
+    .filter(F.col("end_time") >= f"{target_date} 00:00:00") \
+    .select(
+        "vin",
+        "trip_type",
+        # [修改] 日期格式增加月份和日期，方便观察跨天效果
+        F.date_format("start_time", "MM-dd HH:mm:ss").alias("开始时间"), 
+        F.date_format("end_time", "MM-dd HH:mm:ss").alias("结束时间"),
+        F.round("max_speed", 2).alias("Max_Speed"),
+        F.round("avg_speed", 2).alias("Avg_Speed"),
+        F.round((F.unix_timestamp("end_time") - F.unix_timestamp("start_time")) / 60, 1).alias("时长(分钟)")
+    ).orderBy("vin", "开始时间")
 
-for v in vins:
-    print(f"\n\n=======================================================")
-    print(f" 🚘 当前车辆: {v}")
-    print(f"=======================================================")
-    
-    print("\n[A. 切分前的原始动作序列 (已浓缩)]")
-    raw_summary_df.filter(F.col("vin") == v).select(
-        "action_label", 
-        F.date_format("动作开始时间", "HH:mm:ss").alias("开始"), 
-        F.date_format("动作结束时间", "HH:mm:ss").alias("结束"), 
-        "大概车速"
-    ).show(truncate=False)
+# 抽取每个场景的代表车辆进行打印展示
+print("\n=== 场景 A 代表车 (红绿灯防切碎验证) ===")
+output_df.filter(F.col("vin") == "LSV_SCENARIO_A_001").show(truncate=False)
 
-    print("\n[B. 切分后的行程结果表 (TRIP)]")
-    trips_df.filter(F.col("vin") == v).select(
-        "trip_type", 
-        F.date_format("start_time", "HH:mm:ss").alias("开始时间"), 
-        F.date_format("end_time", "HH:mm:ss").alias("结束时间"),
-        F.round("max_speed", 2).alias("最高时速"),
-        F.round("avg_speed", 2).alias("平均时速")
-    ).orderBy("开始时间").show(truncate=False)
+print("\n=== 场景 B 代表车 (纯车内休息验证) ===")
+output_df.filter(F.col("vin") == "LSV_SCENARIO_B_021").show(truncate=False)
+
+print("\n=== 场景 C 代表车 (中途超15分钟长怠速硬切分验证) ===")
+output_df.filter(F.col("vin") == "LSV_SCENARIO_C_031").show(truncate=False)
+
+print("\n=== 场景 D 代表车 (加油站 5分钟内下电防抖合并验证) ===")
+output_df.filter(F.col("vin") == "LSV_SCENARIO_D_051").show(truncate=False)
+
+print("\n=== 场景 E 代表车 (进地库直接断网/掉电 兜底结算验证) ===")
+output_df.filter(F.col("vin") == "LSV_SCENARIO_E_071").show(truncate=False)
+
+print("\n=== 场景 F 代表车 (自动启停极短下电 合并验证) ===")
+output_df.filter(F.col("vin") == "LSV_SCENARIO_F_081").show(truncate=False)
+
+print("\n=== 场景 G 代表车 (跨越 0点 的向前借时防截断验证) ===")
+output_df.filter(F.col("vin") == "LSV_SCENARIO_G_101").show(truncate=False)
+
+print("\n📊 总体数据产出统计 (仅限 T 日结束的行程):")
+output_df.groupBy("trip_type").count().show()
 
 spark.stop()
