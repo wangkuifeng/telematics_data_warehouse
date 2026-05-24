@@ -1,0 +1,35 @@
+env: "prod"
+spark:
+  app_prefix: "telematics_dw"
+
+# 定义统一的 Schema (用于反序列化 Kafka 的 JSON)
+schema:
+  vehicle_log: "vin STRING, report_time TIMESTAMP, vehicle_status INT, odometer DOUBLE, speed DOUBLE"
+
+# 运行模式配置
+run_modes:
+  # 离线 T+1 模式
+  offline:
+    source_type: "paimon"
+    checkpoint_dir: "tos://your-bucket/telematics_dw/checkpoints/trip_offline"
+    trigger:
+      available_now: true
+    paimon:
+      table_path: "paimon_catalog.dwd_telematics.dwd_vehicle_logs"
+
+  # 实时当天模式
+  realtime:
+    source_type: "kafka"
+    checkpoint_dir: "tos://your-bucket/telematics_dw/checkpoints/trip_realtime"
+    trigger:
+      processing_time: "10 seconds"
+    kafka:
+      bootstrap_servers: "10.0.0.1:9092,10.0.0.2:9092"
+      topic: "dwd_vehicle_logs_topic"
+      starting_offsets: "latest" # 实时只关心当下
+
+sink:
+  bytehouse:
+    url: "jdbc:bytehouse://your-bytehouse-endpoint:8123"
+    database: "ads_telematics"
+    table: "ads_trip_summary"
