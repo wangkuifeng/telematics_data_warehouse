@@ -199,7 +199,7 @@ def run_trip_engine(spark: SparkSession, run_mode: str):
         trigger_conf = {"processingTime": "10 seconds"}
 
     enriched_stream = raw_stream \
-        .withWatermark("timestamp", "15 minutes") \
+        .withWatermark("timestamp", "0 minutes") \
         .groupBy("vin") \
         .applyInPandasWithState(
             func=process_unified_trip_state,
